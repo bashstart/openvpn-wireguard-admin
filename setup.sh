@@ -93,6 +93,10 @@ divider
 print_info "Boosting network performance..."
 sysctl -w net.core.rmem_max=26214400
 sysctl -w net.core.rmem_default=26214400
+sysctl -w net.core.dev_weight=40
+sysctl -w net.core.netdev_tstamp_prequeue=0
+sysctl -w kernel.randomize_va_space=0
+echo "Network performance boosted."
 print_success "Network performance boosted."
 
 divider
