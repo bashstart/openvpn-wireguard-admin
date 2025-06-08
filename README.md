@@ -7,6 +7,7 @@ Install OpenVPN or WireGuard along with a web admin panel on a freshly created v
 ```bash
 apt update
 apt install sudo wget -y
+sudo apt-get install ca-certificates
 sudo wget https://raw.githubusercontent.com/bashstart/openvpn-wireguard-admin/main/setup.sh -O setup.sh && sudo chmod +x setup.sh && sudo bash setup.sh
 ```
 
