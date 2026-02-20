@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
+# Debian 11 setup: swap + packages + VPN admin panel + WireGuard/OpenVPN + Caddy + UFW + fail2ban
+# Updated for robustness across providers (HTTPS repos, retries, IPv4 fallback, better error handling).
 
-# Define color codes
+set -Eeuo pipefail
+
+# ---------------- Colors & UI ----------------
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -9,365 +13,477 @@ MAGENTA="\033[35m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-divider() {
-    echo -e "${CYAN}------------------------------------------------${RESET}"
+divider() { echo -e "${CYAN}------------------------------------------------${RESET}"; }
+print_error() { echo -e "${RED}[ERROR]: $1${RESET}"; }
+print_info() { echo -e "${BLUE}[INFO]: $1${RESET}"; }
+print_success() { echo -e "${GREEN}[SUCCESS]: $1${RESET}"; }
+print_question() { echo -e "${YELLOW}[QUESTION]: $1${RESET}"; }
+
+# Better error diagnostics
+on_error() {
+  local exit_code=$?
+  local line_no=${1:-"?"}
+  local cmd=${2:-"unknown"}
+  print_error "Command failed (exit code: ${exit_code}) at line ${line_no}: ${cmd}"
+  print_error "Hint: check logs under /root/setup_logs/ (if created) and output above."
+  exit "${exit_code}"
+}
+trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
+
+# ---------------- Helpers ----------------
+require_root() {
+  if [ "$(id -u)" != "0" ]; then
+    echo "Error: This script must be run with root privileges." >&2
+    echo "Please use 'sudo' or log in as the root user and try again." >&2
+    exit 1
+  fi
 }
 
-print_error() {
-    echo -e "${RED}[ERROR]: $1${RESET}"
-}
+command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-print_info() {
-    echo -e "${BLUE}[INFO]: $1${RESET}"
-}
+ask_yes_no() {
+  # Usage: ask_yes_no "Question?" "default" -> returns 0 yes, 1 no
+  # default: "y" or "n"
+  local q="$1"
+  local def="${2:-n}"
+  local prompt
+  if [[ "$def" == "y" ]]; then
+    prompt="(Y/n)"
+  else
+    prompt="(y/N)"
+  fi
 
-print_success() {
-    echo -e "${GREEN}[SUCCESS]: $1${RESET}"
-}
-
-print_question() {
-    echo -e "${YELLOW}[QUESTION]: $1${RESET}"
-}
-
-# Handle errors
-trap 'print_error "Command failed!"' ERR
-set -e
-
-# Ensure the script is run with root privileges
-if [ "$(id -u)" != "0" ]; then
-   echo "Error: This script must be run with root privileges." >&2
-   echo "Please use 'sudo' or log in as the root user and try again." >&2
-   exit 1
-fi
-
-divider
-print_info "Initializing swap memory adjustment script..."
-divider
-
-print_info "Ensuring /var/swapmemory directory exists..."
-mkdir -p /var/swapmemory
-
-divider
-print_info "Checking total RAM and existing swap..."
-TOTAL_RAM=$(free -m | awk '/Mem:/ {print $2}')
-
-if [ "$TOTAL_RAM" -lt 1024 ]; then
-    SWAP_SIZE=$TOTAL_RAM
-else
-    SWAP_SIZE=1000
-fi
-print_success "Swap size determined: $SWAP_SIZE MB."
-
-divider
-if [ -f "/var/swapmemory/swapfile" ]; then
-    print_info "Swapfile already exists. Do you want to resize it to $SWAP_SIZE MB? (yes/no)"
-    read answer
-    if [ "$answer" == "yes" ]; then
-        print_info "Turning off existing swap..."
-        swapoff /var/swapmemory/swapfile
-        print_info "Resizing swapfile..."
-        dd if=/dev/zero of=/var/swapmemory/swapfile bs=1M count=$SWAP_SIZE && \
-        mkswap /var/swapmemory/swapfile && \
-        swapon /var/swapmemory/swapfile && \
-        print_success "Swap memory resized to $SWAP_SIZE MB." || \
-        print_error "Error occurred while resizing swap memory."
-    else
-        print_info "Keeping the current swap size."
+  while true; do
+    print_question "$q $prompt"
+    read -r ans
+    ans="$(echo "${ans:-}" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$ans" ]]; then
+      [[ "$def" == "y" ]] && return 0 || return 1
     fi
-else
-    print_info "Creating new swapfile..."
-    dd if=/dev/zero of=/var/swapmemory/swapfile bs=1M count=$SWAP_SIZE && \
-    mkswap /var/swapmemory/swapfile && \
-    swapon /var/swapmemory/swapfile && \
-    chmod 600 /var/swapmemory/swapfile && \
-    echo "/var/swapmemory/swapfile none swap sw 0 0" >> /etc/fstab && \
-    print_success "Swap memory of size $SWAP_SIZE MB created." || \
-    print_error "Error occurred while creating swap memory."
-fi
-
-divider
-print_info "Showing current swap usage..."
-free -m
-
-divider
-print_info "Boosting network performance..."
-sysctl -w net.core.rmem_max=26214400
-sysctl -w net.core.rmem_default=26214400
-sysctl -w net.core.dev_weight=40
-sysctl -w net.core.netdev_tstamp_prequeue=0
-sysctl -w kernel.randomize_va_space=0
-echo "Network performance boosted."
-print_success "Network performance boosted."
-
-divider
-print_info "Fetching distribution information..."
-divider
-
-divider
-
-# Get distro info
-DISTRO=$(grep "^ID=" /etc/os-release | cut -d'=' -f2 | tr -d '"')
-VERSION_ID=$(grep "VERSION_ID" /etc/os-release | cut -d'=' -f2 | tr -d '"')
-
-if [[ "$DISTRO" == "debian" ]]; then
-    print_info "Detected Debian distribution."
-
-    case "$VERSION_ID" in
-        "11")
-        # Debian 11 Bullseye
-        divider
-        print_info "Setting sources for Debian 11 Bullseye..."
-        tee /etc/apt/sources.list > /dev/null << EOF
-deb http://ftp.debian.org/debian bullseye main contrib non-free 
-deb-src http://ftp.debian.org/debian bullseye main contrib non-free 
-deb http://ftp.debian.org/debian bullseye-updates main contrib non-free 
-deb-src http://ftp.debian.org/debian bullseye-updates main contrib non-free 
-deb http://security.debian.org/debian-security bullseye-security main contrib non-free 
-deb-src http://security.debian.org/debian-security bullseye-security main contrib non-free 
-deb http://ftp.debian.org/debian bullseye-backports main contrib non-free
-EOF
-        print_success "Sources set for Debian 11 Bullseye."
-        ;;
-
-        *)
-        print_error "Detected an unsupported OS version."
-        print_error "Recommended OS: Debian 11 Minimal."
-        read -p "The script is not optimized for this version and there's no guarantee of successful installation. Do you want to proceed? (y/N) " choice
-        case "$choice" in
-    [yY]* )
-        # Add the code to continue installation for other versions here
-        print_info "Continuing installation on unsupported OS version..."
-        ;;
-    * )
-        print_error "Installation aborted."
-        exit 1
+    case "$ans" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) print_error "Please answer yes/y or no/n." ;;
     esac
+  done
+}
 
-                ;;
-        esac
+get_user_choice() {
+  # Compatibility wrapper for your old script usage:
+  # if get_user_choice "Enable monitoring?"; then ...
+  local q="$1"
+  if ask_yes_no "$q" "n"; then
+    return 0
+  else
+    return 1
+  fi
+}
 
-else
-    print_error "Unsupported distribution."
-fi
+safe_mkdir() { mkdir -p "$1"; }
 
-divider
+# ---------------- Logging ----------------
+LOG_DIR="/root/setup_logs"
+safe_mkdir "$LOG_DIR"
+MAIN_LOG="$LOG_DIR/setup_$(date +%F_%H-%M-%S).log"
+touch "$MAIN_LOG"
 
-divider
-print_info "Updating system packages..."
+# Mirror all output to log while keeping console readable
+exec > >(tee -a "$MAIN_LOG") 2>&1
 
-# Using stderr redirection only for apt update
-OUTPUT=$(apt update 2>/dev/null && apt upgrade -y 2>&1)
+# ---------------- APT Robust Functions ----------------
+APT_FORCE_IPV4=0
 
-if [ $? -eq 0 ]; then
-    print_success "System packages updated successfully."
-    echo "Upgraded packages:"
-    echo "$OUTPUT" | grep 'upgraded'
-else
-    print_error "Failed to update system packages!"
+apt_set_force_ipv4() {
+  # If provider has broken IPv6, forcing IPv4 solves a lot of "temporary failure resolving" / hangs.
+  APT_FORCE_IPV4=1
+  mkdir -p /etc/apt/apt.conf.d
+  cat > /etc/apt/apt.conf.d/99force-ipv4 <<'EOF'
+Acquire::ForceIPv4 "true";
+EOF
+  print_info "APT is now configured to force IPv4."
+}
+
+apt_unset_force_ipv4() {
+  APT_FORCE_IPV4=0
+  rm -f /etc/apt/apt.conf.d/99force-ipv4 || true
+}
+
+apt_retry() {
+  # Usage: apt_retry "description" command...
+  # Retries command 3 times; if it fails, tries IPv4 force and retries 3 more times.
+  local desc="$1"
+  shift
+  local tries=3
+  local i=1
+
+  print_info "$desc"
+  while (( i <= tries )); do
+    if "$@"; then
+      print_success "$desc (ok)"
+      return 0
+    fi
+    print_error "$desc failed (attempt $i/$tries). Retrying in 3s..."
+    sleep 3
+    ((i++))
+  done
+
+  # If not already forcing IPv4, enable and retry
+  if [[ "$APT_FORCE_IPV4" -eq 0 ]]; then
+    print_info "Trying again with IPv4 forced (common fix for provider IPv6 issues)..."
+    apt_set_force_ipv4
+    i=1
+    while (( i <= tries )); do
+      if "$@"; then
+        print_success "$desc (ok with ForceIPv4)"
+        return 0
+      fi
+      print_error "$desc failed with ForceIPv4 (attempt $i/$tries). Retrying in 3s..."
+      sleep 3
+      ((i++))
+    done
+  fi
+
+  print_error "$desc failed after retries."
+  return 1
+}
+
+apt_update() {
+  apt_retry "Running apt-get update..." apt-get update -y
+}
+
+apt_upgrade() {
+  # Use noninteractive + keep existing configs by default to avoid script hanging
+  export DEBIAN_FRONTEND=noninteractive
+  apt_retry "Running apt-get -y upgrade..." \
+    apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
+}
+
+apt_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt_retry "Installing packages: $*" apt-get install -y "$@"
+}
+
+# ---------------- OS Detection & Sources ----------------
+detect_distro() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    DISTRO="${ID:-unknown}"
+    VERSION_ID="${VERSION_ID:-unknown}"
+    CODENAME="${VERSION_CODENAME:-}"
+  else
+    DISTRO="unknown"
+    VERSION_ID="unknown"
+    CODENAME=""
+  fi
+}
+
+set_debian11_sources() {
+  # Debian 11 (bullseye) - use HTTPS mirrors (more reliable across providers).
+  cat > /etc/apt/sources.list <<'EOF'
+deb https://deb.debian.org/debian bullseye main contrib non-free
+deb https://deb.debian.org/debian bullseye-updates main contrib non-free
+deb https://security.debian.org/debian-security bullseye-security main contrib non-free
+deb https://deb.debian.org/debian bullseye-backports main contrib non-free
+EOF
+}
+
+# ---------------- Swap Setup ----------------
+setup_swap() {
+  divider
+  print_info "Setting up swap..."
+  divider
+
+  safe_mkdir /var/swapmemory
+  local total_ram
+  total_ram="$(free -m | awk '/Mem:/ {print $2}')"
+  if [[ -z "$total_ram" ]]; then
+    print_error "Could not detect total RAM."
     exit 1
-fi
+  fi
 
-divider
-print_info "Installing necessary packages..."
+  local swap_size
+  if (( total_ram < 1024 )); then
+    swap_size="$total_ram"
+  else
+    swap_size=1000
+  fi
+  print_success "Swap size determined: ${swap_size} MB."
 
-LOGFILE="/root/apt_install.log"
-DEBIAN_FRONTEND=noninteractive apt install -y ufw git wget python3 python3-pip screen gpg fail2ban curl cron debian-keyring debian-archive-keyring apt-transport-https apt-transport-https systemd >$LOGFILE 2>&1
+  local swapfile="/var/swapmemory/swapfile"
 
-if [ $? -eq 0 ]; then
-    print_success "Necessary packages installed successfully."
-else
-    print_error "Failed to install necessary packages!"
-    print_info "Please check the log file for details: $LOGFILE"
+  if [[ -f "$swapfile" ]]; then
+    if ask_yes_no "Swapfile already exists. Resize to ${swap_size} MB?" "n"; then
+      print_info "Turning off existing swap..."
+      swapoff "$swapfile" || true
+
+      print_info "Resizing swapfile..."
+      rm -f "$swapfile"
+      # Create with correct permissions from start
+      umask 077
+      dd if=/dev/zero of="$swapfile" bs=1M count="$swap_size" status=progress
+      chmod 600 "$swapfile"
+      mkswap "$swapfile"
+      swapon "$swapfile"
+      print_success "Swap resized to ${swap_size} MB."
+    else
+      print_info "Keeping current swap size."
+    fi
+  else
+    print_info "Creating new swapfile..."
+    umask 077
+    dd if=/dev/zero of="$swapfile" bs=1M count="$swap_size" status=progress
+    chmod 600 "$swapfile"
+    mkswap "$swapfile"
+    swapon "$swapfile"
+
+    # Add to fstab only if not present
+    if ! grep -qE "^[^#]*\s${swapfile//\//\\/}\s" /etc/fstab; then
+      echo "$swapfile none swap sw 0 0" >> /etc/fstab
+      print_info "Added swap entry to /etc/fstab."
+    else
+      print_info "Swap entry already exists in /etc/fstab."
+    fi
+    print_success "Swap of size ${swap_size} MB created."
+  fi
+
+  divider
+  print_info "Current memory & swap usage:"
+  free -m
+}
+
+# ---------------- Sysctl Tuning ----------------
+apply_sysctl_tuning() {
+  divider
+  print_info "Applying network/sysctl tuning..."
+  divider
+
+  # Safer tuning: DO NOT disable ASLR (randomize_va_space).
+  # Some values are subjective; keep minimal + reversible.
+  cat > /etc/sysctl.d/99-vpn-tuning.conf <<'EOF'
+# VPN / network tuning (conservative)
+net.core.rmem_max = 26214400
+net.core.rmem_default = 26214400
+net.core.wmem_max = 26214400
+net.core.wmem_default = 26214400
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 4096
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 5
+EOF
+
+  sysctl --system >/dev/null
+  print_success "Sysctl tuning applied and persisted in /etc/sysctl.d/99-vpn-tuning.conf"
+}
+
+# ---------------- Packages & Services ----------------
+install_base_packages() {
+  divider
+  print_info "Fetching distribution information..."
+  divider
+  detect_distro
+
+  if [[ "$DISTRO" != "debian" ]]; then
+    print_error "Unsupported distribution: $DISTRO"
     exit 1
-fi
+  fi
 
-divider
-print_info "Synchronizing system time..."
-divider
+  print_info "Detected Debian (VERSION_ID=$VERSION_ID, CODENAME=${CODENAME:-unknown})."
 
-# Update package list
-if apt update; then
-    print_success "Package list updated."
-else
-    print_error "Failed to update package list."
-    exit 1
-fi
+  if [[ "$VERSION_ID" == "11" ]]; then
+    divider
+    print_info "Setting sources for Debian 11 Bullseye (HTTPS mirrors)..."
+    set_debian11_sources
+    print_success "Sources set for Debian 11 Bullseye."
+  else
+    print_error "Detected unsupported Debian version: $VERSION_ID"
+    print_error "Recommended OS: Debian 11 Minimal."
+    if ! ask_yes_no "Proceed anyway?" "n"; then
+      print_error "Installation aborted."
+      exit 1
+    fi
+    print_info "Continuing on unsupported version (best effort)."
+  fi
 
-# Install ntp package
-if apt install ntp -y; then
-    print_success "NTP package installed successfully."
-else
-    print_error "Failed to install NTP package."
-    exit 1
-fi
+  divider
+  print_info "Updating system packages..."
+  divider
 
-# Start ntp service
-if systemctl start ntp; then
-    print_success "NTP service started successfully."
-else
-    print_error "Failed to start NTP service."
-    exit 1
-fi
+  apt_update
+  apt_upgrade
 
-# Enable ntp service at boot
-if systemctl enable ntp; then
-    print_success "NTP service enabled to start at boot."
-else
-    print_error "Failed to enable NTP service at boot."
-    exit 1
-fi
+  divider
+  print_info "Installing necessary packages..."
+  divider
 
-print_success "System time is synchronized."
+  # Avoid duplicate apt-transport-https; also note: apt on bullseye already supports https, but ok.
+  apt_install ufw git wget python3 python3-pip screen gpg fail2ban curl cron ca-certificates \
+              debian-keyring debian-archive-keyring apt-transport-https systemd
 
-divider
+  print_success "Base packages installed."
+}
 
-divider
-print_info "Installing fail2ban..."
-divider
+setup_time_sync() {
+  divider
+  print_info "Synchronizing system time..."
+  divider
 
-if apt install -y fail2ban; then
-    systemctl enable fail2ban
-    systemctl start fail2ban
-    print_success "fail2ban installed and started successfully."
-else
-    print_error "Failed to install fail2ban."
-    exit 1
-fi
+  # Prefer systemd-timesyncd on Debian 11 instead of ntp package (simpler, less conflicts).
+  # But if you prefer classic ntp, you can change back.
+  if systemctl list-unit-files | grep -q '^systemd-timesyncd\.service'; then
+    systemctl enable --now systemd-timesyncd
+    timedatectl set-ntp true || true
+    print_success "Time sync enabled via systemd-timesyncd."
+  else
+    print_info "systemd-timesyncd not found, installing ntp..."
+    apt_install ntp
+    systemctl enable --now ntp
+    print_success "Time sync enabled via ntp."
+  fi
+}
 
-divider
+setup_fail2ban() {
+  divider
+  print_info "Installing/starting fail2ban..."
+  divider
 
-divider
-print_info "Setting up the web admin panel..."
-divider
+  # Already installed in base packages, but ensure enabled
+  systemctl enable --now fail2ban
+  print_success "fail2ban is enabled and running."
+}
 
-cd
-if git clone https://github.com/dashroshan/openvpn-wireguard-admin vpn; then
-    print_success "Cloned the Web admin panel successfully."
-else
-    print_error "Failed to clone the Web admin panel."
-    exit 1
-fi
+# ---------------- Web Admin Panel ----------------
+setup_web_admin_panel() {
+  divider
+  print_info "Setting up the web admin panel..."
+  divider
 
-cd vpn
-if python3 -m pip install -r requirements.txt; then
+  cd /root
+
+  if [[ -d /root/vpn ]]; then
+    if ask_yes_no "/root/vpn already exists. Remove and re-clone?" "n"; then
+      rm -rf /root/vpn
+    else
+      print_info "Using existing /root/vpn directory."
+    fi
+  fi
+
+  if [[ ! -d /root/vpn ]]; then
+    if git clone https://github.com/dashroshan/openvpn-wireguard-admin vpn; then
+      print_success "Cloned the Web admin panel successfully."
+    else
+      print_error "Failed to clone the Web admin panel."
+      exit 1
+    fi
+  fi
+
+  cd /root/vpn
+
+  # Ensure pip is up to date (often fixes dependency issues on providers)
+  python3 -m pip install --upgrade pip setuptools wheel
+
+  if python3 -m pip install -r requirements.txt; then
     print_success "Requirements for Web admin panel installed successfully."
-else
+  else
     print_error "Failed to install requirements for Web admin panel."
     exit 1
-fi
+  fi
 
-divider
-print_question "Web admin panel username: "
-read adminuser
+  divider
+  print_question "Web admin panel username: "
+  read -r adminuser
 
-# Simple validation for the username
-while [[ ! "$adminuser" =~ ^[a-zA-Z0-9_]{3,15}$ ]]; do
-    print_error "Username should be between 3 and 15 characters long and can only contain alphanumeric characters and underscores."
+  while [[ ! "$adminuser" =~ ^[a-zA-Z0-9_]{3,15}$ ]]; do
+    print_error "Username should be 3-15 chars and contain only letters/digits/underscore."
     print_question "Web admin panel username: "
-    read adminuser
-done
+    read -r adminuser
+  done
 
-# Read the password with hidden input
-print_question "Web admin panel password: "
-read -s adminpass
-echo
+  print_question "Web admin panel password: "
+  read -rs adminpass
+  echo
 
-# Validate the password based on the chosen requirements.
-
-# The following block checks for:
-# - At least one uppercase character
-# - At least one lowercase character
-# - At least one digit
-# - Password length between 8 and 64 characters
-while [[ ! "$adminpass" =~ [A-Z] ]] || 
-      [[ ! "$adminpass" =~ [a-z] ]] || 
-      [[ ! "$adminpass" =~ [0-9] ]] || 
-      [[ ${#adminpass} -lt 8 ]] || 
-      [[ ${#adminpass} -gt 64 ]]; do
-    print_error "Password must be between 8 and 64 characters, include at least one uppercase letter, one lowercase letter, and one number."
+  while [[ ! "$adminpass" =~ [A-Z] ]] ||
+        [[ ! "$adminpass" =~ [a-z] ]] ||
+        [[ ! "$adminpass" =~ [0-9] ]] ||
+        [[ ${#adminpass} -lt 8 ]] ||
+        [[ ${#adminpass} -gt 64 ]]; do
+    print_error "Password must be 8-64 chars and include uppercase, lowercase, and a number."
     print_question "Web admin panel password: "
-    read -s adminpass
+    read -rs adminpass
     echo
-done
+  done
 
-# Alternative simpler password requirements (uncomment as needed):
+  print_question "Confirm password: "
+  read -rs adminpass_confirm
+  echo
 
-# 1. No specific requirements for the password.
-# print_question "Web admin panel password (no restrictions): "
-# read -s adminpass
-# echo
-
-# 2. Only check for password length.
-# while [[ ${#adminpass} -lt 8 ]] || [[ ${#adminpass} -gt 64 ]]; do
-#     print_error "Password must be between 8 and 64 characters."
-#     print_question "Web admin panel password: "
-#     read -s adminpass
-#     echo
-# done
-
-# 3. Password can only contain letters.
-# while [[ ! "$adminpass" =~ ^[a-zA-Z]+$ ]]; do
-#     print_error "Password can only contain letters."
-#     print_question "Web admin panel password: "
-#     read -s adminpass
-#     echo
-# done
-
-# Confirm the password with hidden input
-print_question "Confirm password: "
-read -s adminpass_confirm
-echo
-
-# Check if the passwords match
-while [[ "$adminpass" != "$adminpass_confirm" ]]; do
-    print_error "Passwords do not match. Please try again."
+  while [[ "$adminpass" != "$adminpass_confirm" ]]; do
+    print_error "Passwords do not match. Try again."
     print_question "Web admin panel password: "
-    read -s adminpass
+    read -rs adminpass
     echo
-
     print_question "Confirm password: "
-    read -s adminpass_confirm
+    read -rs adminpass_confirm
     echo
-done
+  done
 
-passwordhash=$(echo -n $adminpass | sha256sum | cut -d" " -f1)
+  passwordhash="$(echo -n "$adminpass" | sha256sum | cut -d" " -f1)"
 
-print_info "Setting up VPN service..."
+  # Export for later
+  ADMIN_USER="$adminuser"
+  ADMIN_PASSHASH="$passwordhash"
+}
 
-while true; do
+# ---------------- VPN Install (WireGuard/OpenVPN) ----------------
+install_vpn() {
+  divider
+  print_info "Setting up VPN service..."
+  divider
+
+  while true; do
     print_question "1) WireGuard"
     print_question "2) OpenVPN"
-    read -p "Enter choice [1-2]: " choice
+    read -rp "Enter choice [1-2]: " choice
 
-    case $choice in
-        1)
-            vpntype="wireguard"
-            print_info "Downloading WireGuard setup script..."
-            if wget https://raw.githubusercontent.com/Nyr/wireguard-install/master/wireguard-install.sh -O vpn-install.sh; then
-                print_success "WireGuard setup script downloaded successfully."
-                chmod +x vpn-install.sh
-                ./vpn-install.sh
-                print_success "WireGuard service installed successfully."
-            else
-                print_error "Failed to download WireGuard setup script."
-                exit 1
-            fi
+    case "$choice" in
+      1)
+        vpntype="wireguard"
+        print_info "Downloading WireGuard install script..."
+        wget -O /root/vpn-install.sh https://raw.githubusercontent.com/Nyr/wireguard-install/master/wireguard-install.sh
+        chmod +x /root/vpn-install.sh
+        /root/vpn-install.sh
+        print_success "WireGuard installed."
 
-            WIREGUARD_CONFIG="/etc/wireguard/wg0.conf"
-            port=$(grep -Po '(?<=ListenPort\s=\s)\d+' "$WIREGUARD_CONFIG")
+        WIREGUARD_CONFIG="/etc/wireguard/wg0.conf"
+        if [[ ! -f "$WIREGUARD_CONFIG" ]]; then
+          print_error "WireGuard config not found at $WIREGUARD_CONFIG"
+          exit 1
+        fi
 
-            if [ -z "$port" ]; then
-                print_error "Failed to extract port from WireGuard configuration."
-                exit 1
-            fi
-			
-			ufw allow out on wg0 from any to any
-			ufw reload
+        port="$(grep -Po '(?<=ListenPort\s=\s)\d+' "$WIREGUARD_CONFIG" || true)"
+        if [[ -z "$port" ]]; then
+          print_error "Failed to extract WireGuard port from $WIREGUARD_CONFIG"
+          exit 1
+        fi
 
-            print_info "Setting up logging for WireGuard..."
-            LOGFILE_PATH="/var/log/wireguard.log"
-            echo "@reboot root sleep 20 && /usr/bin/journalctl -u wg-quick@wg0.service -f -n 0 -o cat | tee -a /var/log/wireguard.log &" >> /etc/cron.d/wireguard_custom
-            cat <<EOF > /etc/fail2ban/jail.d/wireguard.conf
+        # UFW rule: wg0 outbound allow is ok but may fail if interface not up yet; ignore non-fatal
+        ufw allow out on wg0 from any to any || true
+        ufw reload || true
+
+        print_info "Setting up logging for WireGuard..."
+        LOGFILE_PATH="/var/log/wireguard.log"
+        touch "$LOGFILE_PATH"
+        chmod 600 "$LOGFILE_PATH"
+
+        # journalctl follow at reboot (note: this is a bit hacky but keeps your intent)
+        cat > /etc/cron.d/wireguard_custom <<'EOF'
+@reboot root sleep 20 && /usr/bin/journalctl -u wg-quick@wg0.service -f -n 0 -o cat | /usr/bin/tee -a /var/log/wireguard.log &
+EOF
+
+        cat > /etc/fail2ban/jail.d/wireguard.conf <<EOF
 [wireguard]
 enabled  = true
 port     = $port
@@ -375,103 +491,89 @@ filter   = wireguard
 logpath  = $LOGFILE_PATH
 maxretry = 3
 EOF
-            print_success "Configured logging for WireGuard."
+        print_success "Configured fail2ban jail for WireGuard."
 
-            print_info "Setting up filter for WireGuard..."
-            cat <<EOF > /etc/fail2ban/filter.d/wireguard.conf
+        cat > /etc/fail2ban/filter.d/wireguard.conf <<'EOF'
 [Definition]
 failregex = .*WG:.*\[.*\]: Handshake for peer .* failed for .*: Invalid MAC=
-           .*peer:(\S+).*AllowedIPs\s*=\s*0.0.0.0\/0
 ignoreregex =
 EOF
+        print_success "Configured fail2ban filter for WireGuard."
 
-            # Simplified AdBlock choice
-            print_question "Choose an option for AdBlock:"
-            echo "1. True"
-            echo "2. False"
-            read -p "Enter 1 or 2: " choice
+        print_question "Choose an option for AdBlock:"
+        echo "1. True"
+        echo "2. False"
+        read -rp "Enter 1 or 2: " adchoice
+        case "$adchoice" in
+          1) adblock="True" ;;
+          2) adblock="False" ;;
+          *) print_error "Invalid choice. Exiting."; exit 1 ;;
+        esac
 
-            case $choice in
-                1) adblock="True" ;;
-                2) adblock="False" ;;
-                *) echo "Invalid choice. Exiting."; exit 1 ;;
-            esac
-
-            cat << EOF > configWireguard.py
+        cat > /root/vpn/configWireguard.py <<EOF
 wireGuardBlockAds = $adblock
 EOF
-            print_success "configureWireguard.py file created for AdBlock settings."
+        print_success "configWireguard.py created."
 
-            divider
+        CRON_JOB_FILE="/etc/cron.d/wireguard_cron_tasks"
+        : > "$CRON_JOB_FILE"
 
-            # Define the path to save the cron job file
-            CRON_JOB_FILE="/etc/cron.d/wireguard_cron_tasks"
+        divider
+        print_info "Would you like to set up auto-restart for WireGuard?"
+        if get_user_choice "Enable auto-restart?"; then
+          print_question "Enter restart interval in hours (e.g., 2 = every 2 hours):"
+          read -r restart_interval
+          if [[ ! "$restart_interval" =~ ^[0-9]+$ ]] || [[ "$restart_interval" -lt 1 ]] || [[ "$restart_interval" -gt 168 ]]; then
+            print_error "Invalid interval. Using 6 hours."
+            restart_interval=6
+          fi
+          echo "@reboot root /usr/bin/systemctl restart wg-quick@wg0" >> "$CRON_JOB_FILE"
+          echo "0 */$restart_interval * * * root /usr/bin/systemctl restart wg-quick@wg0" >> "$CRON_JOB_FILE"
+          print_success "Auto-restart configured."
+        fi
 
-            # Clear previous jobs if they exist
-            > $CRON_JOB_FILE
+        divider
+        print_info "Would you like to enable unattended upgrades (auto updates)?"
+        if get_user_choice "Enable automatic updates?"; then
+          apt_install unattended-upgrades
+          dpkg-reconfigure -f noninteractive unattended-upgrades || true
+          print_success "Unattended upgrades enabled."
+        fi
 
-            divider
-            print_info "Would you like to set up auto-restart for the server?"
+        divider
+        print_info "Would you like to set up local monitoring for WireGuard?"
+        if get_user_choice "Enable monitoring?"; then
+          MONITORING_DEST="/root/vpn/wireguard_status.log"
+          echo "* * * * * root /usr/bin/wg show > $MONITORING_DEST" >> "$CRON_JOB_FILE"
+          print_success "Monitoring enabled: $MONITORING_DEST updated every minute."
+        fi
 
-            if get_user_choice "Enable auto-restart?"; then
-                print_question "Enter the time interval for server restart (e.g., 2 for every 2 hours):"
-                read restart_interval
-                echo "@reboot root /usr/bin/systemctl restart wg-quick@wg0" >> $CRON_JOB_FILE
-                echo "0 */$restart_interval * * * root /usr/bin/systemctl restart wg-quick@wg0" >> $CRON_JOB_FILE
-                print_success "Auto-restart setup completed."
-            fi
+        break
+        ;;
 
-            divider
-print_info "Would you like to set up automatic updates for WireGuard?"
+      2)
+        vpntype="openvpn"
+        print_info "Downloading OpenVPN install script..."
+        wget -O /root/vpn-install.sh https://raw.githubusercontent.com/Nyr/openvpn-install/master/openvpn-install.sh
+        chmod +x /root/vpn-install.sh
+        /root/vpn-install.sh
+        print_success "OpenVPN installed."
 
-if get_user_choice "Enable automatic updates?"; then
-    apt-get install -y unattended-upgrades
-    echo 'Unattended-Upgrade::Allowed-Origins {' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo '        "${distro_id}:${distro_codename}";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo '        "${distro_id}:${distro_codename}-security";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo '        "${distro_id}ESM:${distro_codename}";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo '};' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    print_success "Auto-update for WireGuard setup completed."
-fi
+        local_conf="/etc/openvpn/server/server.conf"
+        if [[ ! -f "$local_conf" ]]; then
+          print_error "OpenVPN config not found at $local_conf"
+          exit 1
+        fi
 
-            divider
-            print_info "Would you like to set up local monitoring for WireGuard?"
+        port="$(grep -Po '(?<=^port\s)\d+' "$local_conf" || true)"
+        protocol="$(grep -Po '(?<=^proto\s)\w+' "$local_conf" || true)"
 
-            if get_user_choice "Enable monitoring?"; then
-                MONITORING_DEST="/root/vpn/wireguard_status.log"
-                echo "* * * * * root wg show > $MONITORING_DEST" >> $CRON_JOB_FILE
-                print_success "Local monitoring for WireGuard has been set up and logs will be saved to $MONITORING_DEST every minute."
-            fi
+        if [[ -z "$port" || -z "$protocol" ]]; then
+          print_error "Failed to extract port/protocol from $local_conf"
+          exit 1
+        fi
 
-            divider
-            print_info "All configurations are set up!"
-            break
-            ;;
-
-        2)
-            vpntype="openvpn"
-            print_info "Downloading OpenVPN setup script..."
-
-            if wget https://raw.githubusercontent.com/Nyr/openvpn-install/master/openvpn-install.sh -O vpn-install.sh; then
-                print_success "OpenVPN setup script downloaded successfully."
-                chmod +x vpn-install.sh
-                ./vpn-install.sh
-                print_success "OpenVPN service installed successfully."
-            else
-                print_error "Failed to download OpenVPN setup script."
-                exit 1
-            fi
-
-            port=$(grep -Po '(?<=^port\s)\d+' /etc/openvpn/server/server.conf)
-            protocol=$(grep -Po '(?<=^proto\s)\w+' /etc/openvpn/server/server.conf)
-
-            if [ -z "$port" ] || [ -z "$protocol" ]; then
-                print_error "Failed to extract port or protocol from OpenVPN configuration."
-                exit 1
-            fi
-
-            print_info "Configuring fail2ban for OpenVPN..."
-            cat << EOF > /etc/fail2ban/jail.d/openvpn.conf
+        cat > /etc/fail2ban/jail.d/openvpn.conf <<EOF
 [openvpn]
 enabled  = true
 port     = $port
@@ -481,114 +583,87 @@ logpath  = /var/log/openvpn.log
 maxretry = 3
 bantime  = 3600
 EOF
-            print_success "Configured fail2ban for OpenVPN."
+        print_success "Configured fail2ban jail for OpenVPN."
 
-            print_info "Setting up filter for OpenVPN..."
-            cat <<EOF > /etc/fail2ban/filter.d/openvpn.conf
+        cat > /etc/fail2ban/filter.d/openvpn.conf <<'EOF'
 [Definition]
 failregex = TLS Auth Error: Auth Username/Password verification failed for peer
+ignoreregex =
 EOF
-            print_success "Set up filter for OpenVPN."
+        print_success "Configured fail2ban filter for OpenVPN."
 
-            divider
-            CRON_JOB_FILE="/etc/cron.d/openvpn_cron_tasks"
-            > $CRON_JOB_FILE
+        CRON_JOB_FILE="/etc/cron.d/openvpn_cron_tasks"
+        : > "$CRON_JOB_FILE"
 
-            divider
-            print_info "Would you like to set up auto-restart for the OpenVPN server?"
+        divider
+        print_info "Would you like to set up auto-restart for OpenVPN?"
+        if ask_yes_no "Enable auto-restart?" "n"; then
+          print_question "Enter restart interval in hours (e.g., 2 = every 2 hours):"
+          read -r restart_interval
+          if [[ ! "$restart_interval" =~ ^[0-9]+$ ]] || [[ "$restart_interval" -lt 1 ]] || [[ "$restart_interval" -gt 168 ]]; then
+            print_error "Invalid interval. Using 6 hours."
+            restart_interval=6
+          fi
+          echo "@reboot root /usr/bin/systemctl restart openvpn-server@server" >> "$CRON_JOB_FILE"
+          echo "0 */$restart_interval * * * root /usr/bin/systemctl restart openvpn-server@server" >> "$CRON_JOB_FILE"
+          print_success "Auto-restart configured."
+        fi
 
-            while true; do
-                print_question "Enable auto-restart? (yes/y or no/n)"
-                read openvpn_choice_restart
+        divider
+        print_info "Would you like to enable unattended upgrades (auto updates)?"
+        if ask_yes_no "Enable automatic updates?" "n"; then
+          apt_install unattended-upgrades
+          dpkg-reconfigure -f noninteractive unattended-upgrades || true
+          print_success "Unattended upgrades enabled."
+        fi
 
-                case "$openvpn_choice_restart" in
-                    yes|y)
-                        print_question "Enter the time interval for server restart (e.g., 2 for every 2 hours):"
-                        read restart_interval
-                        echo "@reboot root /usr/bin/systemctl restart openvpn-server@server" >> $CRON_JOB_FILE
-                        echo "0 */$restart_interval * * * root /usr/bin/systemctl restart openvpn-server@server" >> $CRON_JOB_FILE
-                        print_success "Auto-restart setup completed for OpenVPN."
-                        break
-                        ;;
-                    no|n)
-                        break
-                        ;;
-                    *)
-                        print_error "Invalid choice. Please answer yes/y or no/n."
-                        ;;
-                esac
-            done
+        divider
+        print_info "Would you like to set up local monitoring for OpenVPN?"
+        if ask_yes_no "Enable monitoring?" "n"; then
+          MONITORING_DEST="/root/vpn/openvpn_status.log"
+          echo "* * * * * root cat /etc/openvpn/server/openvpn-status.log > $MONITORING_DEST" >> "$CRON_JOB_FILE"
+          print_success "Monitoring enabled: $MONITORING_DEST updated every minute."
+        fi
 
-            divider
-            print_info "Would you like to set up automatic updates for OpenVPN?"
+        break
+        ;;
 
-            while true; do
-                print_question "Enable automatic updates? (yes/y or no/n)"
-                read openvpn_choice_updates
-
-                case "$openvpn_choice_updates" in
-                    yes|y)
-    apt-get install -y unattended-upgrades
-    echo 'Unattended-Upgrade::Allowed-Origins {' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo '        "${distro_id}:${distro_codename}";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo '        "${distro_id}:${distro_codename}-security";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo '        "${distro_id}ESM:${distro_codename}";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo '};' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    print_success "Auto-update for OpenVPN setup completed."
-    break
-    ;;
-                    *)
-                        print_error "Invalid choice. Please answer yes/y or no/n."
-                        ;;
-                esac
-            done
-
-            divider
-            print_info "Would you like to set up local monitoring for OpenVPN?"
-
-            while true; do
-                print_question "Enable monitoring? (yes/y or no/n)"
-                read openvpn_choice_monitoring
-
-                case "$openvpn_choice_monitoring" in
-                    yes|y)
-                        MONITORING_DEST="/root/vpn/openvpn_status.log"
-                        echo "* * * * * root cat /etc/openvpn/server/openvpn-status.log > $MONITORING_DEST" >> $CRON_JOB_FILE
-                        print_success "Local monitoring for OpenVPN has been set up and logs will be saved to $MONITORING_DEST every minute."
-                        break
-                        ;;
-                    no|n)
-                        break
-                        ;;
-                    *)
-                        print_error "Invalid choice. Please answer yes/y or no/n."
-                        ;;
-                esac
-            done
-
-            divider
-            print_info "All configurations for OpenVPN are set up!"
-            break
-            ;;
-        *)
-            print_error "Invalid choice. Please select 1 or 2."
-            ;;
+      *)
+        print_error "Invalid choice. Please select 1 or 2."
+        ;;
     esac
-done
+  done
 
-cd
-cd vpn
-cat << EOF > config.py
-import $vpntype as vpn
+  VPN_TYPE="$vpntype"
+  VPN_PORT="$port"
+  VPN_PROTO="${protocol:-udp}"
+}
+
+# ---------------- Web Panel config.py ----------------
+write_webpanel_config() {
+  divider
+  print_info "Writing web admin panel config..."
+  divider
+
+  cd /root/vpn
+
+  cat > /root/vpn/config.py <<EOF
+import $VPN_TYPE as vpn
 creds = {
-    "username": "$adminuser",
-    "password": "$passwordhash",
+    "username": "$ADMIN_USER",
+    "password": "$ADMIN_PASSHASH",
 }
 EOF
-print_success "config.py file created for web admin panel."
+  print_success "config.py created."
+}
 
-print_info "Configuring fail2ban for SSH on port 22..."
-cat << EOF > /etc/fail2ban/jail.d/custom-sshd.conf
+# ---------------- fail2ban SSH ----------------
+setup_fail2ban_ssh() {
+  divider
+  print_info "Configuring fail2ban for SSH on port 22..."
+  divider
+
+  cat > /etc/fail2ban/jail.d/custom-sshd.conf <<'EOF'
 [sshd]
 enabled  = true
 port     = 22
@@ -597,190 +672,163 @@ logpath  = /var/log/auth.log
 maxretry = 3
 bantime  = 3600
 EOF
-print_success "Configured fail2ban for SSH on port 22."
 
-print_info "Restarting fail2ban..."
-systemctl restart fail2ban
-print_success "Restarted fail2ban successfully."
+  systemctl restart fail2ban
+  print_success "fail2ban SSH jail configured and fail2ban restarted."
+}
 
-divider
-print_info "Configuring firewall ports..."
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp
-ufw allow $port
-ufw allow 80/tcp
-ufw allow 443/tcp
-if [ $? -eq 0 ]; then
-    print_success "Ports 22, 80, 443, and $port opened successfully."
-else
-    print_error "Failed to configure firewall ports!"
-    exit 1
-fi
+# ---------------- UFW ----------------
+setup_firewall() {
+  divider
+  print_info "Configuring firewall (UFW)..."
+  divider
 
-divider
-print_info "Enabling UFW firewall..."
-echo "y" | ufw enable
-if [ $? -eq 0 ]; then
-    print_success "UFW firewall enabled successfully."
-else
-    print_error "Failed to enable UFW firewall!"
-    exit 1
-fi
+  ufw --force reset
+  ufw default deny incoming
+  ufw default allow outgoing
 
-divider
+  ufw allow 22/tcp
+  # VPN port: WireGuard is UDP, OpenVPN can be udp/tcp; allow both if unsure
+  if [[ "$VPN_TYPE" == "wireguard" ]]; then
+    ufw allow "${VPN_PORT}/udp"
+  else
+    # OpenVPN usually uses udp; but keep flexible based on detected protocol
+    ufw allow "${VPN_PORT}/${VPN_PROTO}"
+  fi
+  ufw allow 80/tcp
+  ufw allow 443/tcp
 
-divider
-print_info "Installing Caddy..."
-divider
+  ufw --force enable
+  ufw reload
 
-# Add Caddy's GPG key for package verification
-if curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg; then
-    print_success "Caddy's GPG key added successfully."
-else
-    print_error "Failed to add Caddy's GPG key."
-    exit 1
-fi
+  print_success "UFW enabled. Opened: 22/tcp, 80/tcp, 443/tcp, ${VPN_PORT}/${VPN_TYPE}"
+}
 
-# Add Caddy's APT repository to the source list
-if echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" | tee /etc/apt/sources.list.d/caddy-stable.list; then
-    print_success "Added Caddy's APT repository to the source list."
-else
-    print_error "Failed to add Caddy's APT repository."
-    exit 1
-fi
+# ---------------- Caddy ----------------
+install_caddy() {
+  divider
+  print_info "Installing Caddy..."
+  divider
 
-# Update package list and install Caddy
-if apt update && apt install -y caddy; then
-    print_success "Caddy installed successfully."
-else
-    print_error "Failed to install Caddy."
-    exit 1
-fi
+  # Add Caddy repo (official)
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
+    > /etc/apt/sources.list.d/caddy-stable.list
 
-divider
-print_info "Configuring Caddy..."
-divider
+  apt_update
+  apt_install caddy
 
-# Stop the Caddy service for configuration
-if systemctl stop caddy; then
-    print_success "Caddy service stopped for configuration."
-else
-    print_error "Failed to stop Caddy service."
-    exit 1
-fi
+  print_success "Caddy installed."
+}
 
-# Ask the user for the domain
-while true; do
+configure_caddy() {
+  divider
+  print_info "Configuring Caddy reverse proxy..."
+  divider
+
+  systemctl stop caddy || true
+
+  local admindomain
+  while true; do
     print_question "Enter your Web admin panel domain or subdomain (e.g., sub.example.com): "
-    read admindomain
-
-    # Regex to check if the input might be a valid domain or subdomain
-    if [[ $admindomain =~ ^([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\.?)+\.[a-zA-Z]{2,}$ ]]; then
-        break
-    else
-        print_error "Invalid domain format. Please enter a valid domain or subdomain (e.g., sub.example.com)."
+    read -r admindomain
+    if [[ "$admindomain" =~ ^([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\.?)+\.[a-zA-Z]{2,}$ ]]; then
+      break
     fi
-done
+    print_error "Invalid domain format. Example: panel.example.com"
+  done
 
-# Configure Caddy to use the provided domain details and default proxy to localhost:5000
-cat <<EOF > /etc/caddy/Caddyfile
+  cat > /etc/caddy/Caddyfile <<EOF
 $admindomain {
     reverse_proxy localhost:5000
 }
 EOF
 
-# Adjust permissions to ensure Caddy can read the file
-chmod 644 /etc/caddy/Caddyfile
+  chmod 644 /etc/caddy/Caddyfile
+  caddy fmt --overwrite /etc/caddy/Caddyfile
 
-# Format the Caddyfile
-if caddy fmt --overwrite /etc/caddy/Caddyfile; then
-    print_success "Caddyfile formatted successfully."
-else
-    print_error "Failed to format Caddyfile."
-    exit 1
-fi
+  systemctl enable --now caddy
+  caddy reload --config /etc/caddy/Caddyfile
 
-# Start the Caddy service and enable it to start on boot
-if systemctl start caddy && systemctl enable caddy; then
-    print_success "Caddy service started and enabled on boot."
-else
-    print_error "Failed to start and enable Caddy service."
-    exit 1
-fi
-
-# Reload Caddy configuration specifying the path to the Caddyfile
-if caddy reload --config /etc/caddy/Caddyfile; then
-    print_success "Caddy configuration reloaded successfully."
-else
-    print_error "Failed to reload Caddy configuration."
-    exit 1
-fi
-
-if systemctl is-active --quiet caddy; then
-    print_success "Reverse proxy configured with Caddy."
-else
+  if systemctl is-active --quiet caddy; then
+    print_success "Caddy reverse proxy configured for: $admindomain"
+  else
     print_error "Caddy service isn't running."
     exit 1
-fi
+  fi
 
-divider
+  ADMIN_DOMAIN="$admindomain"
+}
 
-divider
-print_info "Setting up the startup script..."
+# ---------------- Startup Script ----------------
+setup_startup_script() {
+  divider
+  print_info "Setting up startup script for web panel..."
+  divider
 
-# Define the path to save the startup script
-SCRIPT_PATH="/root/startup.sh"
-
-# Creating the startup script with a heredoc
-cat <<EOL > $SCRIPT_PATH
+  local script_path="/root/startup.sh"
+  cat > "$script_path" <<'EOL'
 #!/usr/bin/env bash
+set -euo pipefail
 
-# Delay to stabilize the system after reboot
 sleep 5
-
-# Change to the correct directory
 cd /root/vpn
-
-# Launch the application using the determined path for python3
-env nohup python3 main.py &> /root/vpn/vpn.log &
-
+# Run web panel in background, log to file
+nohup python3 main.py > /root/vpn/vpn.log 2>&1 &
 EOL
 
-# Making the startup script executable
-chmod +x $SCRIPT_PATH
-print_success "Startup script setup completed."
+  chmod +x "$script_path"
 
-divider
-print_info "Checking and adding the startup.sh script to cron for auto-start at boot..."
+  local cron_file="/etc/cron.d/my_startup_script"
+  if [[ ! -f "$cron_file" ]]; then
+    echo "@reboot root $script_path" > "$cron_file"
+    chmod 644 "$cron_file"
+    print_success "Startup script added to cron (@reboot)."
+  else
+    print_info "Cron startup file already exists: $cron_file"
+  fi
+}
 
-CRON_JOB_FILE="/etc/cron.d/my_startup_script"
+# ---------------- Main ----------------
+main() {
+  require_root
 
-# Check if our cron job file already exists
-if [ ! -f "$CRON_JOB_FILE" ]; then
-    echo "@reboot root $SCRIPT_PATH" > $CRON_JOB_FILE
-    if [ $? -eq 0 ]; then
-        print_success "Script is set up and added to cron for automatic startup."
-    else
-        print_error "Failed to add the script to cron."
-    fi
-else
-    print_info "Script already exists in cron."
-fi
+  divider
+  print_info "Initializing setup script (Debian 11 hardened)..."
+  print_info "Log file: $MAIN_LOG"
+  divider
 
-divider
-print_question "For the changes to take effect, a reboot is required. Would you like to reboot the computer now? (yes/no)"
-read choice
+  setup_swap
+  apply_sysctl_tuning
 
-case "$(echo $choice | tr '[:upper:]' '[:lower:]')" in 
-  y|yes )
+  install_base_packages
+  setup_time_sync
+  setup_fail2ban
+
+  setup_web_admin_panel
+  install_vpn
+  write_webpanel_config
+
+  setup_fail2ban_ssh
+  setup_firewall
+
+  install_caddy
+  configure_caddy
+
+  setup_startup_script
+
+  divider
+  print_success "Installation finished."
+  print_info "Web panel should be available at: https://$ADMIN_DOMAIN"
+  print_info "Logs: $MAIN_LOG and /root/vpn/vpn.log"
+  divider
+
+  if ask_yes_no "For changes to take effect fully, reboot is recommended. Reboot now?" "n"; then
     print_info "Rebooting now..."
     reboot
-    ;;
-  n|no )
-    print_success "Please remember to reboot the computer later."
-    ;;
-  * )
-    print_error "Invalid input. Please remember to reboot the computer later."
-    ;;
-esac
+  else
+    print_success "Please remember to reboot later."
+  fi
+}
+
+main
