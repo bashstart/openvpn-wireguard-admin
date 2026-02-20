@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Debian 11 setup: swap + packages + VPN admin panel + WireGuard/OpenVPN + Caddy + UFW + fail2ban
-# Updated for robustness across providers (HTTPS repos, retries, IPv4 fallback, better error handling).
+# Fix: bullseye-backports may be removed from deb.debian.org (404 / no Release file).
+# We keep backports disabled by default, optional archived backports support.
 
 set -Eeuo pipefail
 
@@ -25,7 +26,7 @@ on_error() {
   local line_no=${1:-"?"}
   local cmd=${2:-"unknown"}
   print_error "Command failed (exit code: ${exit_code}) at line ${line_no}: ${cmd}"
-  print_error "Hint: check logs under /root/setup_logs/ (if created) and output above."
+  print_error "Hint: check logs under /root/setup_logs/ and output above."
   exit "${exit_code}"
 }
 trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
@@ -39,19 +40,12 @@ require_root() {
   fi
 }
 
-command_exists() { command -v "$1" >/dev/null 2>&1; }
-
 ask_yes_no() {
   # Usage: ask_yes_no "Question?" "default" -> returns 0 yes, 1 no
-  # default: "y" or "n"
   local q="$1"
   local def="${2:-n}"
   local prompt
-  if [[ "$def" == "y" ]]; then
-    prompt="(Y/n)"
-  else
-    prompt="(y/N)"
-  fi
+  if [[ "$def" == "y" ]]; then prompt="(Y/n)"; else prompt="(y/N)"; fi
 
   while true; do
     print_question "$q $prompt"
@@ -69,14 +63,9 @@ ask_yes_no() {
 }
 
 get_user_choice() {
-  # Compatibility wrapper for your old script usage:
-  # if get_user_choice "Enable monitoring?"; then ...
+  # Compatibility wrapper for older script usage
   local q="$1"
-  if ask_yes_no "$q" "n"; then
-    return 0
-  else
-    return 1
-  fi
+  if ask_yes_no "$q" "n"; then return 0; else return 1; fi
 }
 
 safe_mkdir() { mkdir -p "$1"; }
@@ -86,15 +75,12 @@ LOG_DIR="/root/setup_logs"
 safe_mkdir "$LOG_DIR"
 MAIN_LOG="$LOG_DIR/setup_$(date +%F_%H-%M-%S).log"
 touch "$MAIN_LOG"
-
-# Mirror all output to log while keeping console readable
 exec > >(tee -a "$MAIN_LOG") 2>&1
 
 # ---------------- APT Robust Functions ----------------
 APT_FORCE_IPV4=0
 
 apt_set_force_ipv4() {
-  # If provider has broken IPv6, forcing IPv4 solves a lot of "temporary failure resolving" / hangs.
   APT_FORCE_IPV4=1
   mkdir -p /etc/apt/apt.conf.d
   cat > /etc/apt/apt.conf.d/99force-ipv4 <<'EOF'
@@ -103,16 +89,9 @@ EOF
   print_info "APT is now configured to force IPv4."
 }
 
-apt_unset_force_ipv4() {
-  APT_FORCE_IPV4=0
-  rm -f /etc/apt/apt.conf.d/99force-ipv4 || true
-}
-
 apt_retry() {
   # Usage: apt_retry "description" command...
-  # Retries command 3 times; if it fails, tries IPv4 force and retries 3 more times.
-  local desc="$1"
-  shift
+  local desc="$1"; shift
   local tries=3
   local i=1
 
@@ -127,7 +106,6 @@ apt_retry() {
     ((i++))
   done
 
-  # If not already forcing IPv4, enable and retry
   if [[ "$APT_FORCE_IPV4" -eq 0 ]]; then
     print_info "Trying again with IPv4 forced (common fix for provider IPv6 issues)..."
     apt_set_force_ipv4
@@ -147,12 +125,16 @@ apt_retry() {
   return 1
 }
 
+apt_update_raw() {
+  # raw update, used by auto-fix logic
+  apt-get update -y
+}
+
 apt_update() {
-  apt_retry "Running apt-get update..." apt-get update -y
+  apt_retry "Running apt-get update..." apt_update_raw
 }
 
 apt_upgrade() {
-  # Use noninteractive + keep existing configs by default to avoid script hanging
   export DEBIAN_FRONTEND=noninteractive
   apt_retry "Running apt-get -y upgrade..." \
     apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
@@ -178,14 +160,67 @@ detect_distro() {
   fi
 }
 
-set_debian11_sources() {
-  # Debian 11 (bullseye) - use HTTPS mirrors (more reliable across providers).
+# Default (recommended): Debian 11 without backports (backports often removed -> 404)
+write_sources_debian11_no_backports() {
   cat > /etc/apt/sources.list <<'EOF'
 deb https://deb.debian.org/debian bullseye main contrib non-free
 deb https://deb.debian.org/debian bullseye-updates main contrib non-free
 deb https://security.debian.org/debian-security bullseye-security main contrib non-free
-deb https://deb.debian.org/debian bullseye-backports main contrib non-free
 EOF
+}
+
+# Optional: archived backports (ONLY if user really needs it)
+# Note: archive can require disabling Valid-Until checks.
+write_sources_debian11_archived_backports() {
+  cat > /etc/apt/sources.list <<'EOF'
+deb https://deb.debian.org/debian bullseye main contrib non-free
+deb https://deb.debian.org/debian bullseye-updates main contrib non-free
+deb https://security.debian.org/debian-security bullseye-security main contrib non-free
+
+# Bullseye-backports is archived (deb.debian.org may return 404/no Release).
+# Use archive.debian.org if you really need backports.
+deb http://archive.debian.org/debian bullseye-backports main contrib non-free
+EOF
+
+  mkdir -p /etc/apt/apt.conf.d
+  cat > /etc/apt/apt.conf.d/99archive-debian <<'EOF'
+Acquire::Check-Valid-Until "false";
+EOF
+}
+
+# Auto-fix for broken backports entry: remove/comment it and re-run apt update
+fix_backports_if_broken() {
+  # Detect the specific error in the last apt output (log contains it too),
+  # but we can just test connectivity by running apt_update_raw and checking stderr in temp.
+  local tmp_out
+  tmp_out="$(mktemp)"
+  set +e
+  apt-get update -y >"$tmp_out" 2>&1
+  local rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    rm -f "$tmp_out"
+    return 0
+  fi
+
+  if grep -qE "bullseye-backports.*(404|does not have a Release file|No Release file)" "$tmp_out"; then
+    print_error "Detected broken bullseye-backports repository (404 / no Release file). Disabling backports and retrying..."
+    # Remove backports lines from sources.list
+    if [[ -f /etc/apt/sources.list ]]; then
+      sed -i '/bullseye-backports/d' /etc/apt/sources.list
+    fi
+    rm -f "$tmp_out"
+    apt_update
+    return 0
+  fi
+
+  # Not a backports problem
+  print_error "apt-get update failed, and it does not look like a bullseye-backports 404 issue."
+  print_error "Please inspect: $MAIN_LOG"
+  cat "$tmp_out" || true
+  rm -f "$tmp_out"
+  return 1
 }
 
 # ---------------- Swap Setup ----------------
@@ -203,11 +238,7 @@ setup_swap() {
   fi
 
   local swap_size
-  if (( total_ram < 1024 )); then
-    swap_size="$total_ram"
-  else
-    swap_size=1000
-  fi
+  if (( total_ram < 1024 )); then swap_size="$total_ram"; else swap_size=1000; fi
   print_success "Swap size determined: ${swap_size} MB."
 
   local swapfile="/var/swapmemory/swapfile"
@@ -219,7 +250,6 @@ setup_swap() {
 
       print_info "Resizing swapfile..."
       rm -f "$swapfile"
-      # Create with correct permissions from start
       umask 077
       dd if=/dev/zero of="$swapfile" bs=1M count="$swap_size" status=progress
       chmod 600 "$swapfile"
@@ -237,13 +267,13 @@ setup_swap() {
     mkswap "$swapfile"
     swapon "$swapfile"
 
-    # Add to fstab only if not present
     if ! grep -qE "^[^#]*\s${swapfile//\//\\/}\s" /etc/fstab; then
       echo "$swapfile none swap sw 0 0" >> /etc/fstab
       print_info "Added swap entry to /etc/fstab."
     else
       print_info "Swap entry already exists in /etc/fstab."
     fi
+
     print_success "Swap of size ${swap_size} MB created."
   fi
 
@@ -258,8 +288,7 @@ apply_sysctl_tuning() {
   print_info "Applying network/sysctl tuning..."
   divider
 
-  # Safer tuning: DO NOT disable ASLR (randomize_va_space).
-  # Some values are subjective; keep minimal + reversible.
+  # Important: DO NOT disable ASLR (kernel.randomize_va_space=0) for security.
   cat > /etc/sysctl.d/99-vpn-tuning.conf <<'EOF'
 # VPN / network tuning (conservative)
 net.core.rmem_max = 26214400
@@ -294,9 +323,20 @@ install_base_packages() {
 
   if [[ "$VERSION_ID" == "11" ]]; then
     divider
-    print_info "Setting sources for Debian 11 Bullseye (HTTPS mirrors)..."
-    set_debian11_sources
-    print_success "Sources set for Debian 11 Bullseye."
+    print_info "Configuring Debian 11 sources (WITHOUT backports by default)..."
+    write_sources_debian11_no_backports
+    print_success "Sources set for Debian 11 Bullseye (no backports)."
+
+    # Optional: archived backports
+    divider
+    print_info "Note: bullseye-backports can be removed from deb.debian.org and cause apt failures."
+    if ask_yes_no "Do you want to enable ARCHIVED bullseye-backports (archive.debian.org)?" "n"; then
+      print_info "Enabling archived backports..."
+      write_sources_debian11_archived_backports
+      print_success "Archived backports enabled (archive.debian.org)."
+    else
+      print_info "Backports remain disabled (recommended)."
+    fi
   else
     print_error "Detected unsupported Debian version: $VERSION_ID"
     print_error "Recommended OS: Debian 11 Minimal."
@@ -311,14 +351,18 @@ install_base_packages() {
   print_info "Updating system packages..."
   divider
 
-  apt_update
+  # First attempt normal update; if it fails due to backports, auto-disable and retry.
+  if ! apt_update; then
+    print_error "Initial apt update failed, trying auto-fix for backports..."
+    fix_backports_if_broken
+  fi
+
   apt_upgrade
 
   divider
   print_info "Installing necessary packages..."
   divider
 
-  # Avoid duplicate apt-transport-https; also note: apt on bullseye already supports https, but ok.
   apt_install ufw git wget python3 python3-pip screen gpg fail2ban curl cron ca-certificates \
               debian-keyring debian-archive-keyring apt-transport-https systemd
 
@@ -330,8 +374,6 @@ setup_time_sync() {
   print_info "Synchronizing system time..."
   divider
 
-  # Prefer systemd-timesyncd on Debian 11 instead of ntp package (simpler, less conflicts).
-  # But if you prefer classic ntp, you can change back.
   if systemctl list-unit-files | grep -q '^systemd-timesyncd\.service'; then
     systemctl enable --now systemd-timesyncd
     timedatectl set-ntp true || true
@@ -346,10 +388,8 @@ setup_time_sync() {
 
 setup_fail2ban() {
   divider
-  print_info "Installing/starting fail2ban..."
+  print_info "Enabling fail2ban..."
   divider
-
-  # Already installed in base packages, but ensure enabled
   systemctl enable --now fail2ban
   print_success "fail2ban is enabled and running."
 }
@@ -371,25 +411,16 @@ setup_web_admin_panel() {
   fi
 
   if [[ ! -d /root/vpn ]]; then
-    if git clone https://github.com/dashroshan/openvpn-wireguard-admin vpn; then
-      print_success "Cloned the Web admin panel successfully."
-    else
-      print_error "Failed to clone the Web admin panel."
-      exit 1
-    fi
+    git clone https://github.com/dashroshan/openvpn-wireguard-admin vpn
+    print_success "Cloned the Web admin panel successfully."
   fi
 
   cd /root/vpn
 
-  # Ensure pip is up to date (often fixes dependency issues on providers)
   python3 -m pip install --upgrade pip setuptools wheel
 
-  if python3 -m pip install -r requirements.txt; then
-    print_success "Requirements for Web admin panel installed successfully."
-  else
-    print_error "Failed to install requirements for Web admin panel."
-    exit 1
-  fi
+  python3 -m pip install -r requirements.txt
+  print_success "Requirements for Web admin panel installed successfully."
 
   divider
   print_question "Web admin panel username: "
@@ -432,7 +463,6 @@ setup_web_admin_panel() {
 
   passwordhash="$(echo -n "$adminpass" | sha256sum | cut -d" " -f1)"
 
-  # Export for later
   ADMIN_USER="$adminuser"
   ADMIN_PASSHASH="$passwordhash"
 }
@@ -469,7 +499,6 @@ install_vpn() {
           exit 1
         fi
 
-        # UFW rule: wg0 outbound allow is ok but may fail if interface not up yet; ignore non-fatal
         ufw allow out on wg0 from any to any || true
         ufw reload || true
 
@@ -478,7 +507,6 @@ install_vpn() {
         touch "$LOGFILE_PATH"
         chmod 600 "$LOGFILE_PATH"
 
-        # journalctl follow at reboot (note: this is a bit hacky but keeps your intent)
         cat > /etc/cron.d/wireguard_custom <<'EOF'
 @reboot root sleep 20 && /usr/bin/journalctl -u wg-quick@wg0.service -f -n 0 -o cat | /usr/bin/tee -a /var/log/wireguard.log &
 EOF
@@ -688,11 +716,9 @@ setup_firewall() {
   ufw default allow outgoing
 
   ufw allow 22/tcp
-  # VPN port: WireGuard is UDP, OpenVPN can be udp/tcp; allow both if unsure
   if [[ "$VPN_TYPE" == "wireguard" ]]; then
     ufw allow "${VPN_PORT}/udp"
   else
-    # OpenVPN usually uses udp; but keep flexible based on detected protocol
     ufw allow "${VPN_PORT}/${VPN_PROTO}"
   fi
   ufw allow 80/tcp
@@ -701,7 +727,7 @@ setup_firewall() {
   ufw --force enable
   ufw reload
 
-  print_success "UFW enabled. Opened: 22/tcp, 80/tcp, 443/tcp, ${VPN_PORT}/${VPN_TYPE}"
+  print_success "UFW enabled. Opened: 22/tcp, 80/tcp, 443/tcp, ${VPN_PORT} (${VPN_TYPE})"
 }
 
 # ---------------- Caddy ----------------
@@ -710,14 +736,17 @@ install_caddy() {
   print_info "Installing Caddy..."
   divider
 
-  # Add Caddy repo (official)
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
     > /etc/apt/sources.list.d/caddy-stable.list
 
-  apt_update
-  apt_install caddy
+  # Update again (this should now work even if backports was problematic)
+  if ! apt_update; then
+    print_error "apt update failed after adding Caddy repo. Trying auto-fix for backports..."
+    fix_backports_if_broken
+  fi
 
+  apt_install caddy
   print_success "Caddy installed."
 }
 
@@ -773,7 +802,6 @@ set -euo pipefail
 
 sleep 5
 cd /root/vpn
-# Run web panel in background, log to file
 nohup python3 main.py > /root/vpn/vpn.log 2>&1 &
 EOL
 
